@@ -2,7 +2,6 @@ import logging
 import time
 import csv
 import os
-import re
 import requests
 from datetime import datetime
 
@@ -12,8 +11,8 @@ from datetime import datetime
 TOKEN    = "8651051857:AAEjY3MKNuoFiRFu4YG2zUGf2tKCgMuWZo8"
 CHAT_ID  = "803725273"
 
-INTERVALO_SCAN = 30    # segundos entre varreduras
-SCORE_MINIMO   = 40    # score de pressão mínimo para alertar
+INTERVALO_SCAN = 30   # segundos entre varreduras
+SCORE_MINIMO   = 40   # score de pressão mínimo
 
 CHUTES_GOL_PESO    = 3
 ATAQUES_PERIG_PESO = 1
@@ -62,126 +61,108 @@ def enviar_telegram(mensagem):
         logging.error(f"Telegram exceção: {e}")
 
 # ============================================================
-# FLASHSCORE API INTERNA
-# Headers necessários para a API interna do Flashscore
+# SOFASCORE API
 # ============================================================
-FS_HEADERS = {
+SOFA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.flashscore.com/",
-    "x-fsign": "SW9D1eZo",  # token fixo da API interna
+    "Accept": "application/json",
+    "Referer": "https://www.sofascore.com/",
 }
 
 def buscar_jogos_ao_vivo():
-    """
-    Busca todos os jogos ao vivo do Flashscore via API interna.
-    Retorna lista de dicts com dados dos jogos.
-    """
-    url = "https://d.flashscore.com/x/feed/f_1_0_3_en_1"
+    """Busca todos os jogos de futebol ao vivo via API da SofaScore."""
+    url = "https://api.sofascore.com/api/v1/sport/football/events/live"
     try:
-        resp = requests.get(url, headers=FS_HEADERS, timeout=15)
+        resp = requests.get(url, headers=SOFA_HEADERS, timeout=15)
         resp.raise_for_status()
-        return parsear_feed(resp.text)
+        data = resp.json()
+        eventos = data.get("events", [])
+        jogos = []
+
+        for ev in eventos:
+            try:
+                status = ev.get("status", {})
+                tipo   = status.get("type", "")
+
+                # Só jogos ao vivo (inprogress)
+                if tipo != "inprogress":
+                    continue
+
+                home   = ev["homeTeam"]["name"]
+                away   = ev["awayTeam"]["name"]
+                jogo_id = ev["id"]
+
+                sh = ev.get("homeScore", {}).get("current", 0) or 0
+                sa = ev.get("awayScore", {}).get("current", 0) or 0
+
+                # Minuto atual
+                minuto = status.get("description", "0")
+                minuto = minuto.replace("'", "").replace("+", "").strip()
+                try:
+                    minuto = int(minuto.split("+")[0]) if "+" in minuto else int(minuto)
+                except:
+                    continue
+
+                jogos.append({
+                    "id": jogo_id,
+                    "home": home,
+                    "away": away,
+                    "sh": sh,
+                    "sa": sa,
+                    "minuto": minuto
+                })
+            except:
+                continue
+
+        return jogos
+
     except Exception as e:
         logging.error(f"❌ Erro ao buscar jogos: {e}")
         return []
 
-def parsear_feed(texto):
-    """
-    O feed do Flashscore é um formato proprietário separado por '¬'.
-    Extrai os dados de cada jogo ao vivo.
-    """
-    jogos = []
-    # Cada jogo começa com AA÷ e termina com ~
-    blocos = texto.split("~")
-    for bloco in blocos:
-        try:
-            jogo = {}
-            partes = bloco.split("¬")
-            for parte in partes:
-                if "÷" in parte:
-                    chave, valor = parte.split("÷", 1)
-                    jogo[chave] = valor
-
-            # Só processa futebol ao vivo (status 6 = ao vivo)
-            if jogo.get("AE") != "6":
-                continue
-
-            # Extrai campos necessários
-            home    = jogo.get("CX", "")  # time da casa
-            away    = jogo.get("AF", "")  # time visitante
-            sh_raw  = jogo.get("AG", "")  # placar casa
-            sa_raw  = jogo.get("AH", "")  # placar visitante
-            min_raw = jogo.get("AN", "")  # minuto
-            jogo_id = jogo.get("AA", "")  # id do jogo
-
-            if not all([home, away, sh_raw, sa_raw, min_raw]):
-                continue
-
-            sh = int(sh_raw)
-            sa = int(sa_raw)
-
-            # Parse do minuto
-            min_raw = min_raw.replace("'", "").strip()
-            if "+" in min_raw:
-                minuto = int(min_raw.split("+")[0])
-            else:
-                minuto = int(min_raw)
-
-            jogos.append({
-                "id": jogo_id,
-                "home": home,
-                "away": away,
-                "sh": sh,
-                "sa": sa,
-                "minuto": minuto
-            })
-        except:
-            continue
-
-    return jogos
-
 def buscar_stats(jogo_id):
-    """
-    Busca estatísticas do jogo via API interna.
-    Retorna dict com chutes no gol, ataques perigosos e posse.
-    """
-    stats = {"chutes_gol_h": 0, "chutes_gol_a": 0,
-             "ataques_h": 0,    "ataques_a": 0,
-             "posse_h": 0}
+    """Busca estatísticas do jogo via API da SofaScore."""
+    stats = {
+        "chutes_gol_h": 0, "chutes_gol_a": 0,
+        "ataques_h": 0,    "ataques_a": 0,
+        "posse_h": 0
+    }
     try:
-        url = f"https://d.flashscore.com/x/feed/d_st_{jogo_id}_en_1"
-        resp = requests.get(url, headers=FS_HEADERS, timeout=10)
+        url = f"https://api.sofascore.com/api/v1/event/{jogo_id}/statistics"
+        resp = requests.get(url, headers=SOFA_HEADERS, timeout=10)
         if not resp.ok:
             return stats
 
-        texto = resp.text
-        blocos = texto.split("~")
+        data = resp.json()
+        grupos = data.get("statistics", [])
 
-        for bloco in blocos:
-            partes = bloco.split("¬")
-            dados = {}
-            for parte in partes:
-                if "÷" in parte:
-                    k, v = parte.split("÷", 1)
-                    dados[k] = v
+        # Pega as estatísticas do período "ALL" ou do 1º grupo disponível
+        periodo = None
+        for g in grupos:
+            if g.get("period") in ("ALL", "1ST", "2ND"):
+                periodo = g
+                break
 
-            nome = dados.get("WI", "").lower()
-            val_h = dados.get("WJ", "0")
-            val_a = dados.get("WK", "0")
+        if not periodo:
+            return stats
 
-            try:
-                if "shots on target" in nome or "shots on goal" in nome:
-                    stats["chutes_gol_h"] = int(val_h)
-                    stats["chutes_gol_a"] = int(val_a)
-                elif "dangerous attacks" in nome:
-                    stats["ataques_h"] = int(val_h)
-                    stats["ataques_a"] = int(val_a)
-                elif "ball possession" in nome:
-                    stats["posse_h"] = int(val_h.replace("%", ""))
-            except:
-                continue
+        for grupo in periodo.get("groups", []):
+            for item in grupo.get("statisticsItems", []):
+                nome = item.get("name", "").lower()
+                try:
+                    h = int(str(item.get("home", 0)).replace("%", "") or 0)
+                    a = int(str(item.get("away", 0)).replace("%", "") or 0)
+                except:
+                    continue
+
+                if "shots on target" in nome:
+                    stats["chutes_gol_h"] = h
+                    stats["chutes_gol_a"] = a
+                elif "dangerous attacks" in nome or "dangerous attack" in nome:
+                    stats["ataques_h"] = h
+                    stats["ataques_a"] = a
+                elif "ball possession" in nome or "possession" in nome:
+                    stats["posse_h"] = h
 
     except Exception as e:
         logging.warning(f"⚠️ Erro stats {jogo_id}: {e}")
@@ -212,7 +193,7 @@ class FlashscoreScanner:
         jid    = jogo["id"]
         total  = sh + sa
 
-        # Define alvo
+        # Define alvo pelo placar e minuto
         alvo = None
         if   total == 0 and 25 <= minuto <= 45: alvo = "OVER 0.5 HT 🕐"
         elif total == 0 and minuto >= 70:        alvo = "OVER 0.5"
@@ -226,14 +207,14 @@ class FlashscoreScanner:
         if chave in self.alertas_enviados:
             return
 
-        # Busca estatísticas via API interna (leve, sem browser)
+        # Busca estatísticas
         stats         = buscar_stats(jid)
         chutes_gol    = stats["chutes_gol_h"] + stats["chutes_gol_a"]
         ataques_perig = stats["ataques_h"]    + stats["ataques_a"]
         posse_home    = stats["posse_h"]
         score         = (chutes_gol * CHUTES_GOL_PESO) + (ataques_perig * ATAQUES_PERIG_PESO)
 
-        # Over HT sempre envia — é urgente
+        # Over HT é urgente — sempre envia
         if alvo != "OVER 0.5 HT 🕐" and score < SCORE_MINIMO:
             logging.info(f"⏭ Ignorado (pressão {score} < {SCORE_MINIMO}): {home} x {away} | {minuto}'")
             return
@@ -257,7 +238,7 @@ class FlashscoreScanner:
         logging.info(f"🚨 {alvo} | {home} x {away} | {minuto}' | pressão: {score}")
 
     def scan(self):
-        logging.info("🔍 Scanner iniciado (modo leve — sem Chrome)")
+        logging.info("🔍 Scanner SofaScore iniciado (sem Chrome)")
 
         while True:
             try:
@@ -283,7 +264,7 @@ class FlashscoreScanner:
 # ============================================================
 if __name__ == "__main__":
     enviar_telegram(
-        f"🚀 <b>Scanner Iniciado! (modo leve)</b>\n"
+        f"🚀 <b>Scanner Iniciado! (SofaScore)</b>\n"
         f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
         f"⚙️ Sem Chrome | Scan: {INTERVALO_SCAN}s | Score mínimo: {SCORE_MINIMO}"
     )
