@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scanner.py .
 
-CMD ["python", "scanner.py"]
+CMD ["python", "-u", "scanner.py"]
