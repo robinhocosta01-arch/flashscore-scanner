@@ -2,35 +2,30 @@ import logging
 import time
 import csv
 import os
+import re
 import requests
 from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 TOKEN    = "8651051857:AAEjY3MKNuoFiRFu4YG2zUGf2tKCgMuWZo8"
 CHAT_ID  = "803725273"
-URL_LIVE = "https://www.flashscore.com"
 
-INTERVALO_SCAN   = 30   # segundos entre varreduras
-INTERVALO_RELOAD = 300  # recarrega página a cada 5 min
-
-# Score mínimo para alertas (exceto OVER HT que é sempre enviado)
-SCORE_MINIMO = 40
+INTERVALO_SCAN = 30    # segundos entre varreduras
+SCORE_MINIMO   = 40    # score de pressão mínimo para alertar
 
 CHUTES_GOL_PESO    = 3
 ATAQUES_PERIG_PESO = 1
 
 # ============================================================
-# LOG
+# LOGGING
 # ============================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
+# ============================================================
+# LOG CSV
+# ============================================================
 LOG_FILE = "jogos_log.csv"
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
@@ -67,241 +62,230 @@ def enviar_telegram(mensagem):
         logging.error(f"Telegram exceção: {e}")
 
 # ============================================================
-# HELPERS
+# FLASHSCORE API INTERNA
+# Headers necessários para a API interna do Flashscore
 # ============================================================
-def parse_minuto(tempo_raw):
-    tempo = tempo_raw.strip().replace("'", "")
-    if tempo in ("HT", "FT", ""):
-        return None
-    if "+" in tempo:
-        return int(tempo.split("+")[0])
-    try:
-        return int(tempo)
-    except:
-        return None
+FS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.flashscore.com/",
+    "x-fsign": "SW9D1eZo",  # token fixo da API interna
+}
 
-def extrair_stat(driver, label):
+def buscar_jogos_ao_vivo():
+    """
+    Busca todos os jogos ao vivo do Flashscore via API interna.
+    Retorna lista de dicts com dados dos jogos.
+    """
+    url = "https://d.flashscore.com/x/feed/f_1_0_3_en_1"
     try:
-        rows = driver.find_elements(By.CLASS_NAME, "stat__row")
-        for row in rows:
+        resp = requests.get(url, headers=FS_HEADERS, timeout=15)
+        resp.raise_for_status()
+        return parsear_feed(resp.text)
+    except Exception as e:
+        logging.error(f"❌ Erro ao buscar jogos: {e}")
+        return []
+
+def parsear_feed(texto):
+    """
+    O feed do Flashscore é um formato proprietário separado por '¬'.
+    Extrai os dados de cada jogo ao vivo.
+    """
+    jogos = []
+    # Cada jogo começa com AA÷ e termina com ~
+    blocos = texto.split("~")
+    for bloco in blocos:
+        try:
+            jogo = {}
+            partes = bloco.split("¬")
+            for parte in partes:
+                if "÷" in parte:
+                    chave, valor = parte.split("÷", 1)
+                    jogo[chave] = valor
+
+            # Só processa futebol ao vivo (status 6 = ao vivo)
+            if jogo.get("AE") != "6":
+                continue
+
+            # Extrai campos necessários
+            home    = jogo.get("CX", "")  # time da casa
+            away    = jogo.get("AF", "")  # time visitante
+            sh_raw  = jogo.get("AG", "")  # placar casa
+            sa_raw  = jogo.get("AH", "")  # placar visitante
+            min_raw = jogo.get("AN", "")  # minuto
+            jogo_id = jogo.get("AA", "")  # id do jogo
+
+            if not all([home, away, sh_raw, sa_raw, min_raw]):
+                continue
+
+            sh = int(sh_raw)
+            sa = int(sa_raw)
+
+            # Parse do minuto
+            min_raw = min_raw.replace("'", "").strip()
+            if "+" in min_raw:
+                minuto = int(min_raw.split("+")[0])
+            else:
+                minuto = int(min_raw)
+
+            jogos.append({
+                "id": jogo_id,
+                "home": home,
+                "away": away,
+                "sh": sh,
+                "sa": sa,
+                "minuto": minuto
+            })
+        except:
+            continue
+
+    return jogos
+
+def buscar_stats(jogo_id):
+    """
+    Busca estatísticas do jogo via API interna.
+    Retorna dict com chutes no gol, ataques perigosos e posse.
+    """
+    stats = {"chutes_gol_h": 0, "chutes_gol_a": 0,
+             "ataques_h": 0,    "ataques_a": 0,
+             "posse_h": 0}
+    try:
+        url = f"https://d.flashscore.com/x/feed/d_st_{jogo_id}_en_1"
+        resp = requests.get(url, headers=FS_HEADERS, timeout=10)
+        if not resp.ok:
+            return stats
+
+        texto = resp.text
+        blocos = texto.split("~")
+
+        for bloco in blocos:
+            partes = bloco.split("¬")
+            dados = {}
+            for parte in partes:
+                if "÷" in parte:
+                    k, v = parte.split("÷", 1)
+                    dados[k] = v
+
+            nome = dados.get("WI", "").lower()
+            val_h = dados.get("WJ", "0")
+            val_a = dados.get("WK", "0")
+
             try:
-                nome = row.find_element(By.CLASS_NAME, "stat__categoryName").text.strip()
-                if label.lower() in nome.lower():
-                    h = row.find_element(By.CLASS_NAME, "stat__homeValue").text.strip()
-                    a = row.find_element(By.CLASS_NAME, "stat__awayValue").text.strip()
-                    return int(h), int(a)
+                if "shots on target" in nome or "shots on goal" in nome:
+                    stats["chutes_gol_h"] = int(val_h)
+                    stats["chutes_gol_a"] = int(val_a)
+                elif "dangerous attacks" in nome:
+                    stats["ataques_h"] = int(val_h)
+                    stats["ataques_a"] = int(val_a)
+                elif "ball possession" in nome:
+                    stats["posse_h"] = int(val_h.replace("%", ""))
             except:
                 continue
-    except:
-        pass
-    return None, None
+
+    except Exception as e:
+        logging.warning(f"⚠️ Erro stats {jogo_id}: {e}")
+
+    return stats
 
 # ============================================================
-# SCANNER — UM SÓ DRIVER
+# SCANNER
 # ============================================================
 class FlashscoreScanner:
     def __init__(self):
         self.alertas_enviados = {}
-        self.ultimo_reload    = 0
         self.total_alertas    = 0
         self.inicio           = datetime.now()
 
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--blink-settings=imagesEnabled=false")
+    def _uptime(self):
+        delta = datetime.now() - self.inicio
+        h, rem = divmod(int(delta.total_seconds()), 3600)
+        m, s   = divmod(rem, 60)
+        return f"{h}h {m}m {s}s"
 
-        # ✅ Aponta para o Chrome instalado pelo Dockerfile no Linux
-        options.binary_location = "/usr/bin/chromium"
+    def processar(self, jogo):
+        home   = jogo["home"]
+        away   = jogo["away"]
+        sh     = jogo["sh"]
+        sa     = jogo["sa"]
+        minuto = jogo["minuto"]
+        jid    = jogo["id"]
+        total  = sh + sa
 
-        from selenium.webdriver.chrome.service import Service
-        service = Service("/usr/bin/chromedriver")
+        # Define alvo
+        alvo = None
+        if   total == 0 and 25 <= minuto <= 45: alvo = "OVER 0.5 HT 🕐"
+        elif total == 0 and minuto >= 70:        alvo = "OVER 0.5"
+        elif total == 1 and minuto <= 60:        alvo = "OVER 1.5"
+        elif total == 2 and minuto <= 75:        alvo = "OVER 2.5"
 
-        # ✅ Um único driver para tudo
-        self.driver = webdriver.Chrome(service=service, options=options)
-        self.wait   = WebDriverWait(self.driver, 25)
-        logging.info("🌐 Driver Chrome iniciado (modo leve)")
+        if not alvo:
+            return
 
-    def _carregar_lista(self):
-        """Carrega a página principal com a lista de jogos."""
-        self.driver.get(URL_LIVE)
-        time.sleep(5)
-        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-        self.ultimo_reload = time.time()
-        logging.info("🔄 Lista de jogos recarregada.")
+        chave = f"{home}_{away}_{alvo}"
+        if chave in self.alertas_enviados:
+            return
 
-    def _buscar_stats(self, jogo_id):
-        """
-        Abre a página de stats do jogo, extrai dados e volta para a lista.
-        Só é chamado quando um jogo candidato é encontrado.
-        """
-        stats = {"chutes_gol_h": 0, "chutes_gol_a": 0,
-                 "ataques_h": 0,    "ataques_a": 0,
-                 "posse_h": 0}
-        try:
-            url_stats = f"https://www.flashscore.com/match/{jogo_id}/#/match-summary/match-statistics/0"
-            self.driver.get(url_stats)
-            time.sleep(3)
+        # Busca estatísticas via API interna (leve, sem browser)
+        stats         = buscar_stats(jid)
+        chutes_gol    = stats["chutes_gol_h"] + stats["chutes_gol_a"]
+        ataques_perig = stats["ataques_h"]    + stats["ataques_a"]
+        posse_home    = stats["posse_h"]
+        score         = (chutes_gol * CHUTES_GOL_PESO) + (ataques_perig * ATAQUES_PERIG_PESO)
 
-            ch, ca = extrair_stat(self.driver, "Shots on Goal")
-            if ch is not None:
-                stats["chutes_gol_h"] = ch
-                stats["chutes_gol_a"] = ca
+        # Over HT sempre envia — é urgente
+        if alvo != "OVER 0.5 HT 🕐" and score < SCORE_MINIMO:
+            logging.info(f"⏭ Ignorado (pressão {score} < {SCORE_MINIMO}): {home} x {away} | {minuto}'")
+            return
 
-            ah, aa = extrair_stat(self.driver, "Dangerous Attacks")
-            if ah is not None:
-                stats["ataques_h"] = ah
-                stats["ataques_a"] = aa
+        barra = "🟩" * min(int(score / 10), 10)
+        msg = (
+            f"🚨 <b>{alvo}</b>\n"
+            f"⚽ {home} {sh} x {sa} {away}\n"
+            f"⏱ {minuto}' | {datetime.now().strftime('%H:%M:%S')}\n"
+            f"\n📊 <b>Estatísticas</b>\n"
+            f"🎯 Chutes no gol: {chutes_gol}\n"
+            f"⚡ Ataques perigosos: {ataques_perig}\n"
+            f"🔵 Posse (casa): {posse_home}%\n"
+            f"🔥 Pressão: {score} {barra}"
+        )
 
-            ph, _ = extrair_stat(self.driver, "Ball Possession")
-            if ph is not None:
-                stats["posse_h"] = ph
-
-        except Exception as e:
-            logging.warning(f"⚠️ Erro stats {jogo_id}: {e}")
-        finally:
-            # ✅ Sempre volta para a lista após buscar stats
-            self.driver.get(URL_LIVE)
-            time.sleep(3)
-            self.ultimo_reload = time.time()
-
-        return stats
-
-    def _processar_candidatos(self, candidatos):
-        """
-        Busca estatísticas apenas dos jogos candidatos
-        e envia alertas se passarem no score de pressão.
-        """
-        for item in candidatos:
-            home, away, sh, sa, minuto, alvo, jogo_id = item
-            chave = f"{home}_{away}_{alvo}"
-
-            if chave in self.alertas_enviados:
-                continue
-
-            stats = self._buscar_stats(jogo_id) if jogo_id else {}
-
-            chutes_gol    = stats.get("chutes_gol_h", 0) + stats.get("chutes_gol_a", 0)
-            ataques_perig = stats.get("ataques_h", 0)    + stats.get("ataques_a", 0)
-            posse_home    = stats.get("posse_h", 0)
-            score         = (chutes_gol * CHUTES_GOL_PESO) + (ataques_perig * ATAQUES_PERIG_PESO)
-
-            # Over HT é urgente — sempre envia
-            if alvo != "OVER 0.5 HT 🕐" and score < SCORE_MINIMO:
-                logging.info(f"⏭ Ignorado (pressão {score} < {SCORE_MINIMO}): {home} x {away} | {minuto}'")
-                continue
-
-            barra = "🟩" * min(int(score / 10), 10)
-            msg = (
-                f"🚨 <b>{alvo}</b>\n"
-                f"⚽ {home} {sh} x {sa} {away}\n"
-                f"⏱ {minuto}' | {datetime.now().strftime('%H:%M:%S')}\n"
-                f"\n📊 <b>Estatísticas</b>\n"
-                f"🎯 Chutes no gol: {chutes_gol}\n"
-                f"⚡ Ataques perigosos: {ataques_perig}\n"
-                f"🔵 Posse (casa): {posse_home}%\n"
-                f"🔥 Pressão: {score} {barra}"
-            )
-
-            enviar_telegram(msg)
-            logar_alerta(home, away, sh, sa, minuto, alvo, chutes_gol, ataques_perig, posse_home, score)
-            self.alertas_enviados[chave] = True
-            self.total_alertas += 1
-            logging.info(f"🚨 {alvo} | {home} x {away} | {minuto}' | pressão: {score}")
-
-    def _varrer_jogos(self):
-        """
-        Varre todos os jogos da lista e retorna apenas os candidatos.
-        Não abre nenhuma página de detalhe — só lê o DOM da lista.
-        """
-        candidatos = []
-        try:
-            self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "event__match")))
-            jogos = self.driver.find_elements(By.CLASS_NAME, "event__match")
-
-            if len(jogos) == 0:
-                logging.warning("⚠️ Nenhum jogo encontrado.")
-                self.driver.save_screenshot("debug.png")
-                return candidatos
-
-            logging.info(f"✅ {len(jogos)} jogos analisados.")
-
-            for jogo in jogos:
-                try:
-                    sh = int(jogo.find_element(By.CLASS_NAME, "event__score--home").text)
-                    sa = int(jogo.find_element(By.CLASS_NAME, "event__score--away").text)
-                except:
-                    continue
-
-                try:
-                    home      = jogo.find_element(By.CLASS_NAME, "event__participant--home").text
-                    away      = jogo.find_element(By.CLASS_NAME, "event__participant--away").text
-                    tempo_raw = jogo.find_element(By.CLASS_NAME, "event__stage--actual").text
-                    jogo_id   = jogo.get_attribute("id").replace("g_1_", "")
-                except:
-                    continue
-
-                minuto = parse_minuto(tempo_raw)
-                if minuto is None:
-                    continue
-
-                total = sh + sa
-                alvo  = None
-                if   total == 0 and 25 <= minuto <= 45: alvo = "OVER 0.5 HT 🕐"
-                elif total == 0 and minuto >= 70:        alvo = "OVER 0.5"
-                elif total == 1 and minuto <= 60:        alvo = "OVER 1.5"
-                elif total == 2 and minuto <= 75:        alvo = "OVER 2.5"
-
-                if alvo:
-                    chave = f"{home}_{away}_{alvo}"
-                    if chave not in self.alertas_enviados:
-                        candidatos.append((home, away, sh, sa, minuto, alvo, jogo_id))
-
-        except Exception as e:
-            logging.error(f"❌ Erro na varredura: {e}")
-
-        return candidatos
+        enviar_telegram(msg)
+        logar_alerta(home, away, sh, sa, minuto, alvo, chutes_gol, ataques_perig, posse_home, score)
+        self.alertas_enviados[chave] = True
+        self.total_alertas += 1
+        logging.info(f"🚨 {alvo} | {home} x {away} | {minuto}' | pressão: {score}")
 
     def scan(self):
-        logging.info("🔍 Iniciando scanner...")
-        self._carregar_lista()
+        logging.info("🔍 Scanner iniciado (modo leve — sem Chrome)")
 
         while True:
             try:
-                # Recarrega lista a cada 5 min
-                if time.time() - self.ultimo_reload >= INTERVALO_RELOAD:
-                    self._carregar_lista()
+                jogos = buscar_jogos_ao_vivo()
 
-                # 1. Varre todos os jogos rapidamente (só lê o DOM)
-                candidatos = self._varrer_jogos()
-
-                # 2. Busca stats só dos candidatos (poucos jogos)
-                if candidatos:
-                    logging.info(f"🔎 {len(candidatos)} candidatos para análise...")
-                    self._processar_candidatos(candidatos)
-                    self._carregar_lista()
-
-                time.sleep(INTERVALO_SCAN)
+                if not jogos:
+                    logging.warning("⚠️ Nenhum jogo ao vivo encontrado.")
+                else:
+                    logging.info(f"✅ {len(jogos)} jogos ao vivo | Uptime: {self._uptime()} | Alertas: {self.total_alertas}")
+                    for jogo in jogos:
+                        try:
+                            self.processar(jogo)
+                        except:
+                            continue
 
             except Exception as e:
-                logging.error(f"❌ Erro geral: {e}. Aguardando 30s...")
-                time.sleep(30)
-                self._carregar_lista()
+                logging.error(f"❌ Erro geral: {e}")
+
+            time.sleep(INTERVALO_SCAN)
 
 # ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
     enviar_telegram(
-        f"🚀 <b>Scanner Iniciado!</b>\n"
+        f"🚀 <b>Scanner Iniciado! (modo leve)</b>\n"
         f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
-        f"⚙️ Scan: {INTERVALO_SCAN}s | Score mínimo: {SCORE_MINIMO}"
+        f"⚙️ Sem Chrome | Scan: {INTERVALO_SCAN}s | Score mínimo: {SCORE_MINIMO}"
     )
     scanner = FlashscoreScanner()
     scanner.scan()
