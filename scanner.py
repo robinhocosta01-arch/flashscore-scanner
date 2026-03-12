@@ -4,6 +4,8 @@ import csv
 import os
 import requests
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -11,8 +13,8 @@ from datetime import datetime
 TOKEN    = "8651051857:AAEjY3MKNuoFiRFu4YG2zUGf2tKCgMuWZo8"
 CHAT_ID  = "803725273"
 
-INTERVALO_SCAN = 30   # segundos entre varreduras
-SCORE_MINIMO   = 40   # score de pressão mínimo
+INTERVALO_SCAN = 30
+SCORE_MINIMO   = 40
 
 CHUTES_GOL_PESO    = 3
 ATAQUES_PERIG_PESO = 1
@@ -61,45 +63,66 @@ def enviar_telegram(mensagem):
         logging.error(f"Telegram exceção: {e}")
 
 # ============================================================
+# SESSION COM RETRY E HEADERS DE BROWSER REAL
+# ============================================================
+def criar_session():
+    session = requests.Session()
+
+    # Retry automático em falhas de rede
+    retry = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+
+    # Headers que imitam Chrome real no Windows
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": "https://www.sofascore.com",
+        "Referer": "https://www.sofascore.com/",
+        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+    })
+
+    return session
+
+SESSION = criar_session()
+
+# ============================================================
 # SOFASCORE API
 # ============================================================
-SOFA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Referer": "https://www.sofascore.com/",
-}
-
 def buscar_jogos_ao_vivo():
-    """Busca todos os jogos de futebol ao vivo via API da SofaScore."""
     url = "https://api.sofascore.com/api/v1/sport/football/events/live"
     try:
-        resp = requests.get(url, headers=SOFA_HEADERS, timeout=15)
+        resp = SESSION.get(url, timeout=15)
         resp.raise_for_status()
-        data = resp.json()
+        data   = resp.json()
         eventos = data.get("events", [])
-        jogos = []
+        jogos  = []
 
         for ev in eventos:
             try:
                 status = ev.get("status", {})
-                tipo   = status.get("type", "")
-
-                # Só jogos ao vivo (inprogress)
-                if tipo != "inprogress":
+                if status.get("type") != "inprogress":
                     continue
 
-                home   = ev["homeTeam"]["name"]
-                away   = ev["awayTeam"]["name"]
+                home    = ev["homeTeam"]["name"]
+                away    = ev["awayTeam"]["name"]
                 jogo_id = ev["id"]
+                sh      = ev.get("homeScore", {}).get("current", 0) or 0
+                sa      = ev.get("awayScore", {}).get("current", 0) or 0
 
-                sh = ev.get("homeScore", {}).get("current", 0) or 0
-                sa = ev.get("awayScore", {}).get("current", 0) or 0
-
-                # Minuto atual
-                minuto = status.get("description", "0")
-                minuto = minuto.replace("'", "").replace("+", "").strip()
+                minuto_raw = status.get("description", "0").replace("'", "").strip()
                 try:
-                    minuto = int(minuto.split("+")[0]) if "+" in minuto else int(minuto)
+                    minuto = int(minuto_raw.split("+")[0]) if "+" in minuto_raw else int(minuto_raw)
                 except:
                     continue
 
@@ -121,23 +144,21 @@ def buscar_jogos_ao_vivo():
         return []
 
 def buscar_stats(jogo_id):
-    """Busca estatísticas do jogo via API da SofaScore."""
     stats = {
         "chutes_gol_h": 0, "chutes_gol_a": 0,
         "ataques_h": 0,    "ataques_a": 0,
         "posse_h": 0
     }
     try:
-        url = f"https://api.sofascore.com/api/v1/event/{jogo_id}/statistics"
-        resp = requests.get(url, headers=SOFA_HEADERS, timeout=10)
+        url  = f"https://api.sofascore.com/api/v1/event/{jogo_id}/statistics"
+        resp = SESSION.get(url, timeout=10)
         if not resp.ok:
             return stats
 
-        data = resp.json()
-        grupos = data.get("statistics", [])
-
-        # Pega as estatísticas do período "ALL" ou do 1º grupo disponível
+        data    = resp.json()
+        grupos  = data.get("statistics", [])
         periodo = None
+
         for g in grupos:
             if g.get("period") in ("ALL", "1ST", "2ND"):
                 periodo = g
@@ -158,10 +179,10 @@ def buscar_stats(jogo_id):
                 if "shots on target" in nome:
                     stats["chutes_gol_h"] = h
                     stats["chutes_gol_a"] = a
-                elif "dangerous attacks" in nome or "dangerous attack" in nome:
+                elif "dangerous attack" in nome:
                     stats["ataques_h"] = h
                     stats["ataques_a"] = a
-                elif "ball possession" in nome or "possession" in nome:
+                elif "possession" in nome:
                     stats["posse_h"] = h
 
     except Exception as e:
@@ -172,14 +193,14 @@ def buscar_stats(jogo_id):
 # ============================================================
 # SCANNER
 # ============================================================
-class FlashscoreScanner:
+class Scanner:
     def __init__(self):
         self.alertas_enviados = {}
         self.total_alertas    = 0
         self.inicio           = datetime.now()
 
     def _uptime(self):
-        delta = datetime.now() - self.inicio
+        delta  = datetime.now() - self.inicio
         h, rem = divmod(int(delta.total_seconds()), 3600)
         m, s   = divmod(rem, 60)
         return f"{h}h {m}m {s}s"
@@ -193,7 +214,6 @@ class FlashscoreScanner:
         jid    = jogo["id"]
         total  = sh + sa
 
-        # Define alvo pelo placar e minuto
         alvo = None
         if   total == 0 and 25 <= minuto <= 45: alvo = "OVER 0.5 HT 🕐"
         elif total == 0 and minuto >= 70:        alvo = "OVER 0.5"
@@ -207,14 +227,12 @@ class FlashscoreScanner:
         if chave in self.alertas_enviados:
             return
 
-        # Busca estatísticas
         stats         = buscar_stats(jid)
         chutes_gol    = stats["chutes_gol_h"] + stats["chutes_gol_a"]
         ataques_perig = stats["ataques_h"]    + stats["ataques_a"]
         posse_home    = stats["posse_h"]
         score         = (chutes_gol * CHUTES_GOL_PESO) + (ataques_perig * ATAQUES_PERIG_PESO)
 
-        # Over HT é urgente — sempre envia
         if alvo != "OVER 0.5 HT 🕐" and score < SCORE_MINIMO:
             logging.info(f"⏭ Ignorado (pressão {score} < {SCORE_MINIMO}): {home} x {away} | {minuto}'")
             return
@@ -247,7 +265,7 @@ class FlashscoreScanner:
                 if not jogos:
                     logging.warning("⚠️ Nenhum jogo ao vivo encontrado.")
                 else:
-                    logging.info(f"✅ {len(jogos)} jogos ao vivo | Uptime: {self._uptime()} | Alertas: {self.total_alertas}")
+                    logging.info(f"✅ {len(jogos)} jogos | Uptime: {self._uptime()} | Alertas: {self.total_alertas}")
                     for jogo in jogos:
                         try:
                             self.processar(jogo)
@@ -268,5 +286,5 @@ if __name__ == "__main__":
         f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
         f"⚙️ Sem Chrome | Scan: {INTERVALO_SCAN}s | Score mínimo: {SCORE_MINIMO}"
     )
-    scanner = FlashscoreScanner()
+    scanner = Scanner()
     scanner.scan()
